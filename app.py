@@ -1,9 +1,8 @@
 """
-Flask API for TTS Generation - Minimal Version
-Loads TTS model ONCE at startup
+Flask API for TTS Generation - Render Ready Version
 """
 
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_from_directory
 import os
 import traceback
 import soundfile as sf
@@ -14,6 +13,10 @@ load_dotenv()
 
 # Import Twilio call module
 from twilio_call import make_call, get_audio_public_url, check_twilio_configured
+
+# Create static/audio directory for generated audio files
+AUDIO_DIR = os.path.join(os.path.dirname(__file__), 'static', 'audio')
+os.makedirs(AUDIO_DIR, exist_ok=True)
 
 app = Flask(__name__)
 
@@ -63,9 +66,7 @@ print("=" * 50)
 def health():
     """Health check endpoint"""
     return jsonify({
-        "status": "healthy",
-        "models_loaded": models_loaded,
-        "twilio_configured": check_twilio_configured()
+        "status": "healthy"
     }), 200
 
 @app.route('/generate', methods=['POST'])
@@ -73,7 +74,7 @@ def generate():
     """
     Generate TTS audio from text and optionally make a phone call.
     Expected JSON: {"text": "Your text here", "make_call": true}
-    Returns: {"success": true, "file": "output.wav", "call_sid": "..."}
+    Returns: {"success": true, "file": "filename.wav", "call_sid": "..."}
     """
     global tts_processor, tts_model, tts_vocoder, speaker_embeddings
     
@@ -104,6 +105,11 @@ def generate():
                 "message": f"Text too long ({len(text)} chars). Max 100 characters."
             }), 400
         
+        # Generate unique filename for this request
+        import uuid
+        filename = f"audio_{uuid.uuid4().hex[:8]}.wav"
+        output_path = os.path.join(AUDIO_DIR, filename)
+        
         # Generate speech using pre-loaded models (no reloading)
         print("[GENERATING] Processing text...")
         inputs = tts_processor(text=text, return_tensors="pt")
@@ -111,25 +117,32 @@ def generate():
         print("[GENERATING] Generating speech...")
         speech = tts_model.generate_speech(inputs["input_ids"], speaker_embeddings, vocoder=tts_vocoder)
         
-        print("[GENERATING] Saving to output.wav...")
+        print(f"[GENERATING] Saving to {filename}...")
         speech_np = speech.cpu().numpy()
-        sf.write("output.wav", speech_np, samplerate=16000)
+        sf.write(output_path, speech_np, samplerate=16000)
         
         print("[SUCCESS] Audio generated successfully")
         
-        # Build response
+        # Build response - use the public URL path
+        audio_url = f"/audio/{filename}"
         response_data = {
             "success": True,
-            "file": "output.wav"
+            "file": audio_url
         }
         
         # Make phone call if requested
         if make_call_flag and check_twilio_configured():
-            print("[TWILIO] Getting audio public URL...")
-            audio_url = get_audio_public_url("output.wav")
+            # Get the public base URL from environment or construct one
+            public_base_url = os.environ.get('PUBLIC_BASE_URL', '')
+            if public_base_url:
+                # Use the public base URL if configured
+                full_audio_url = public_base_url.replace('/audio.wav', f'/{filename}')
+            else:
+                # For local development, use the relative path
+                full_audio_url = audio_url
             
             print(f"[TWILIO] Initiating call to {target_number or 'default'}...")
-            call_result = make_call(audio_url, target_number)
+            call_result = make_call(full_audio_url, target_number)
             
             if call_result.get("success"):
                 response_data["call_sid"] = call_result["call_sid"]
@@ -152,6 +165,17 @@ def generate():
             "message": f"Error: {str(e)}"
         }), 500
 
+@app.route('/audio/<filename>', methods=['GET'])
+def serve_audio(filename):
+    """Serve generated audio files"""
+    # Security: only allow audio files
+    if not filename.endswith('.wav'):
+        return jsonify({"error": "Invalid file type"}), 400
+    
+    return send_from_directory(AUDIO_DIR, filename)
+
 if __name__ == '__main__':
-    print("\nStarting Flask API on port 5050...")
-    app.run(host='0.0.0.0', port=5050, debug=False, use_reloader=False)
+    port = int(os.environ.get("PORT", 5000))
+    print(f"\nStarting Flask API on 0.0.0.0:{port}...")
+    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
+
